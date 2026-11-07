@@ -42,6 +42,7 @@ ALL_ATTACKS = [
     'IDAA',
     'DPA_HMA',
     'DYNAMIC_MORPH',
+    'GGS',
 ]
 
 ATTACK_COLS = {
@@ -66,6 +67,7 @@ ATTACK_COLS = {
     'IDAA': 'idaa_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
+     'GGS': 'ggs_path',
 }
 
 EPSILON = 0.062
@@ -87,6 +89,8 @@ GRA_SIGN_DECAY = 0.94
 PGN_BETA = 3.0
 PGN_GAMMA = 0.5
 PGN_NUM_NEIGHBOR = 20
+GGS_NUM_INNER = 20
+GGS_ZETA_FACTOR = 2.0
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
 DPA_HMA_ENSEMBLE_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_ENSEMBLE_NUM_ITER', str(DPA_HMA_NUM_ITER)))
@@ -1353,6 +1357,42 @@ def pgn_attack(model, x, tgt_emb, attack_type):
         adv = tf.clip_by_value(adv, -1.0, 1.0)
 
     return adv
+# GGS by <Khushi Maheshwari> (<IGDTUW>)
+# Paper basis: Enhancing Adversarial Transferability by Balancing Exploration and
+# Exploitation with Gradient-Guided Sampling (ICCV 2025), Niu et al.
+def ggs_attack(model, x, tgt_emb, attack_type, num_inner: int = GGS_NUM_INNER):
+    adv = tf.identity(x)
+    v = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    zeta = GGS_ZETA_FACTOR * EPSILON
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    g_prev = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
+
+    for _ in range(NUM_ITER):
+        grad_sum = tf.zeros_like(x)
+        for _ in range(num_inner):
+            p = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
+            x_hat = adv + tf.abs(p) * tf.sign(g_prev)
+            x_hat = tf.clip_by_value(x_hat, -1.0, 1.0)
+            with tf.GradientTape() as tape:
+                tape.watch(x_hat)
+                emb = compute_embedding(model, x_hat)
+                cos = tf.reduce_sum(emb * tgt_emb, axis=1)
+                loss = attack_loss(cos, attack_type)
+            g_i = tape.gradient(loss, x_hat)
+            if g_i is None:
+                g_i = tf.zeros_like(x)
+            g_i = tf.where(tf.math.is_finite(g_i), g_i, tf.zeros_like(g_i))
+            grad_sum += g_i
+            g_prev = g_i
+
+        grad_sum = grad_sum / (tf.reduce_mean(tf.abs(grad_sum)) + 1e-8)
+        v = DECAY * v + grad_sum
+        adv = adv + alpha * tf.sign(v)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+    return adv
+
 
 
 def dpa_hma(model, x, tgt_emb, attack_type, num_copies: int = 8, num_iter: int = DPA_HMA_NUM_ITER):
@@ -1585,6 +1625,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
     tgt_emb = compute_embedding(model, tgt)
     if attack_name == 'PGD':
         return pgd_attack(model, src, tgt_emb, attack_type)
+    if attack_name == 'GGS':
+        return ggs_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'MI_FGSM':
         return mi_fgsm(model, src, tgt_emb, attack_type)
     if attack_name == 'TI_FGSM':
